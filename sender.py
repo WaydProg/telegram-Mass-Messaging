@@ -1,160 +1,278 @@
-from telethon import TelegramClient
-from telethon.network import connection
+from telethon.sync import TelegramClient
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.errors import FloodWaitError, UserPrivacyRestrictedError, InviteHashExpiredError, InviteHashInvalidError
-from dotenv import load_dotenv
 import time
 import asyncio
+from datetime import datetime
+
 import os
 
-load_dotenv()
+api_id = int(os.environ["TELEGRAM_API_ID"])
+api_hash = os.environ["TELEGRAM_API_HASH"]
 
-number = os.getenv('number')
-api_id = os.getenv('api_id')
-api_hash = os.getenv('api_hash')
+# Конфигурация
+ARCHIVE_CHAT = "me"  # Куда отправлять информацию о вступивших чатах ("me" для сохраненных сообщений)
+SEND_DELAY = 1  # Задержка между отправками сообщений
+JOIN_DELAY = 5   # Задержка между вступлениями в чаты
+CYCLE_DELAY = 60  # Задержка между циклами, если файл пуст
 
-PROXY_HOST = os.getenv('PROXY_HOST')
-PROXY_PORT = int(os.getenv('PROXY_PORT'))
-PROXY_SECRET = os.getenv('PROXY_SECRET')
-
-TEMPLATE_FILE = "template.txt"
-USERS_FILE = "users.txt"
-PHOTO_FILE = "photo.png"
+client = TelegramClient('6686606151', api_id, api_hash)
 
 def parse_invite_link(link):
     """Парсит ссылку и возвращает username или хэш приглашения"""
+    # Для публичных чатов (https://t.me/username)
     if link.startswith('https://t.me/'):
         parts = link.split('/')
         if len(parts) >= 4 and parts[3]:
-            return parts[3]
+            return parts[3]  # Возвращаем username без @
+    
+    # Для приватных чатов (https://t.me/+invitehash)
     if link.startswith('https://t.me/+'):
-        return link.split('+')[1]
+        return link.split('+')[1]  # Возвращаем хэш приглашения
+    
     return None
 
-def create_client_with_proxy():
-    """Создает клиент с MTProto-прокси через класс MTProtoProxy"""
-    try:
-        secret_bytes = bytes.fromhex(PROXY_SECRET)
-    except ValueError:
-        print("❌ Ошибка: секрет должен быть hex-строкой")
-        raise
-
-    # Явно указываем класс подключения и передаём параметры прокси
-    client = TelegramClient(
-        number,
-        api_id,
-        api_hash,
-        proxy=(PROXY_HOST, PROXY_PORT, PROXY_SECRET),  # для MTProtoProxy используется кортеж (host, port, secret)
-        connection=connection.ConnectionTcpMTProxyAbridged
-    )
-    print(f"🔌 Используем MTProto-прокси: {PROXY_HOST}:{PROXY_PORT}")
-    return client
-
-async def join_chat(client, link):
+async def join_chat(link):
+    """Функция для вступления в чат/канал по ссылке"""
     try:
         identifier = parse_invite_link(link)
         if not identifier:
             print(f"❌ Неверный формат ссылки: {link}")
-            return False
+            return None
+
+        # Для публичных чатов
         if not identifier.startswith('+'):
             await client(JoinChannelRequest(identifier))
+            print(f"✅ Вступили в публичный чат: {identifier}")
+            return identifier
+        
+        # Для приватных чатов с хэшем приглашения
         else:
             await client(ImportChatInviteRequest(identifier))
-        return True
+            print(f"✅ Вступили в приватный чат по хэшу")
+            return identifier
+            
     except FloodWaitError as e:
-        print(f"⏱ FloodWait на {e.seconds} секунд, спим...")
+        print(f"⏱ FloodWait на {e.seconds} секунд при вступлении, спим...")
         await asyncio.sleep(e.seconds)
-        return False
+        return None
     except (InviteHashExpiredError, InviteHashInvalidError):
-        print(f"❌ Недействительная ссылка: {link}")
-        return False
+        print(f"❌ Недействительная или просроченная ссылка: {link}")
+        return None
     except Exception as e:
-        print(f"❌ Ошибка при вступлении: {e}")
-        return False
+        if "already" in str(e).lower():
+            print(f"⚠️ Уже состоим в чате: {link}")
+            return identifier if identifier else link
+        print(f"❌ Ошибка при вступлении в {link}: {e}")
+        return None
 
-async def send_message_with_photo(client, entity, message, photo_path=None):
+async def send_to_archive(link, entity):
+    """Отправляет информацию о чате в архив"""
     try:
-        if photo_path and os.path.exists(photo_path):
-            await client.send_file(entity, photo_path, caption=message)
-            print("✅ Сообщение с фото отправлено")
+        # Получаем информацию о чате
+        if hasattr(entity, 'title'):
+            chat_title = entity.title
+        elif hasattr(entity, 'username'):
+            chat_title = f"@{entity.username}"
+        elif hasattr(entity, 'first_name'):
+            chat_title = f"{entity.first_name} {entity.last_name or ''}".strip()
         else:
-            await client.send_message(entity, message)
-            print("✅ Текстовое сообщение отправлено")
-        return True
-    except FloodWaitError as e:
-        print(f"⏱ FloodWait на {e.seconds} секунд, спим...")
-        await asyncio.sleep(e.seconds)
-        return False
-    except UserPrivacyRestrictedError:
-        print("🔒 Пользователь/чат ограничил ЛС")
-        return False
+            chat_title = "Неизвестный чат"
+        
+        # Создаем сообщение для архива
+        archive_message = f"""
+📋 ЗАПИСЬ В АРХИВ
+────────────────
+🕐 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+🏷 Название: {chat_title}
+🔗 Ссылка: {link}
+👥 ID: {entity.id}
+────────────────
+"""
+        
+        # Отправляем в архив
+        archive_entity = await client.get_entity(ARCHIVE_CHAT)
+        await client.send_message(archive_entity, archive_message)
+        print(f"📁 Информация о чате отправлена в архив: {chat_title}")
+        
     except Exception as e:
-        print(f"❌ Ошибка при отправке: {e}")
-        return False
+        print(f"⚠️ Не удалось отправить в архив: {e}")
 
-async def process_links(client):
-    if not os.path.exists(TEMPLATE_FILE):
-        print(f"❌ Файл {TEMPLATE_FILE} не найден")
-        return
-    with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
-        template = f.read()
-
-    if not os.path.exists(USERS_FILE):
-        print(f"❌ Файл {USERS_FILE} не найден")
-        return
-    with open(USERS_FILE, "r", encoding="utf-8") as f:
-        links = [line.strip() for line in f if line.strip()]
-    if not links:
-        print("⚠️ Список ссылок пуст")
-        return
-
-    photo_path = PHOTO_FILE if os.path.exists(PHOTO_FILE) else None
-
-    print(f"🔄 Обработка {len(links)} ссылок...")
-    for i, link in enumerate(links, 1):
-        print(f"\n[{i}/{len(links)}] {link}")
-
-        success = await join_chat(client, link)
-        if not success:
-            continue
-
-        identifier = parse_invite_link(link)
+async def main_cycle():
+    """Основной цикл рассылки"""
+    await client.start()
+    
+    print("🤖 Бот запущен. Начинаю рассылку...")
+    
+    while True:  # Бесконечный цикл
+        # Читаем шаблон сообщения
         try:
-            entity = await client.get_entity(link) if identifier.startswith('+') else await client.get_entity(identifier)
-        except Exception as e:
-            print(f"⚠️ Не удалось получить entity: {e}")
+            with open("template.txt", "r", encoding="utf-8") as f:
+                template = f.read().strip()
+            
+            if not template:
+                print("⚠️ Файл template.txt пуст. Ожидаю 30 секунд...")
+                await asyncio.sleep(30)
+                continue
+                
+        except FileNotFoundError:
+            print("❌ Файл template.txt не найден. Создайте файл с текстом для рассылки.")
+            await asyncio.sleep(30)
             continue
-
-        message = template.replace("{username}", identifier)
-        await send_message_with_photo(client, entity, message, photo_path)
-
-        if i < len(links):
-            print("⏳ Пауза 50 секунд...")
-            await asyncio.sleep(50)
+        
+        # Читаем список чатов
+        try:
+            with open("users.txt", "r", encoding="utf-8") as f:
+                links = [line.strip() for line in f if line.strip()]
+            
+            if not links:
+                print(f"⚠️ Файл users.txt пуст. Ожидаю {CYCLE_DELAY} секунд...")
+                await asyncio.sleep(CYCLE_DELAY)
+                continue
+                
+        except FileNotFoundError:
+            print("❌ Файл users.txt не найден. Создайте файл со ссылками на чаты.")
+            await asyncio.sleep(30)
+            continue
+        
+        print(f"🔁 Начинаем новый цикл рассылки ({len(links)} чатов)")
+        print(f"📝 Текст для рассылки: {template[:100]}..." if len(template) > 100 else f"📝 Текст для рассылки: {template}")
+        
+        success_count = 0
+        fail_count = 0
+        
+        for i, link in enumerate(links):
+            try:
+                print(f"\n🔗 Обрабатываю чат {i+1}/{len(links)}: {link}")
+                
+                # Пытаемся вступить в чат
+                identifier = await join_chat(link)
+                if not identifier:
+                    fail_count += 1
+                    continue
+                
+                await asyncio.sleep(JOIN_DELAY)
+                
+                # Получаем entity чата для отправки сообщения
+                try:
+                    if identifier.startswith('+'):
+                        # Для приватных чатов ищем через диалоги
+                        entity_found = False
+                        async for dialog in client.iter_dialogs(limit=100):
+                            if dialog.is_channel or dialog.is_group:
+                                # Проверяем разные варианты
+                                if hasattr(dialog.entity, 'username') and dialog.entity.username:
+                                    if f"t.me/{dialog.entity.username}" in link:
+                                        entity = dialog.entity
+                                        entity_found = True
+                                        break
+                                elif hasattr(dialog.entity, 'title'):
+                                    # Можно добавить дополнительную логику для поиска по названию
+                                    pass
+                        
+                        if not entity_found:
+                            # Если не нашли, пробуем получить последний диалог (скорее всего это только что вступивший чат)
+                            dialogs = await client.get_dialogs(limit=10)
+                            if dialogs:
+                                entity = dialogs[0].entity
+                            else:
+                                print(f"⚠️ Не удалось найти приватный чат: {link}")
+                                fail_count += 1
+                                continue
+                    else:
+                        entity = await client.get_entity(identifier)
+                        
+                except Exception as e:
+                    print(f"❌ Не удалось получить информацию о чате {link}: {e}")
+                    fail_count += 1
+                    continue
+                
+                # Отправляем сообщение по шаблону
+                try:
+                    # Заменяем {username} в шаблоне если есть
+                    if "{username}" in template:
+                        if identifier.startswith('+'):
+                            message = template.replace("{username}", "участник")
+                        else:
+                            message = template.replace("{username}", identifier)
+                    else:
+                        message = template
+                    
+                    await client.send_message(entity, message)
+                    print(f"✅ Сообщение отправлено в: {link}")
+                    success_count += 1
+                    
+                    # Отправляем информацию о чате в архив
+                    await send_to_archive(link, entity)
+                    
+                except UserPrivacyRestrictedError:
+                    print(f"🔒 Не удалось отправить сообщение (приватность ограничена): {link}")
+                    fail_count += 1
+                except FloodWaitError as e:
+                    print(f"⏱ FloodWait на {e.seconds} секунд, спим...")
+                    await asyncio.sleep(e.seconds)
+                    # Пробуем снова после ожидания
+                    try:
+                        await client.send_message(entity, message)
+                        print(f"✅ Сообщение отправлено в: {link}")
+                        success_count += 1
+                        await send_to_archive(link, entity)
+                    except:
+                        fail_count += 1
+                except Exception as e:
+                    print(f"❌ Ошибка отправки в {link}: {e}")
+                    fail_count += 1
+                
+                # Задержка перед следующей отправкой
+                if i < len(links) - 1:  # Не ждем после последней отправки
+                    print(f"⏱ Ожидаю {SEND_DELAY} секунд до следующей отправки...")
+                    await asyncio.sleep(SEND_DELAY)
+                
+            except Exception as e:
+                print(f"❌ Критическая ошибка с {link}: {e}")
+                fail_count += 1
+        
+        # Статистика цикла
+        print(f"\n{'='*50}")
+        print(f"📊 ЦИКЛ ЗАВЕРШЕН")
+        print(f"✅ Успешно: {success_count}")
+        print(f"❌ Неудачно: {fail_count}")
+        print(f"🔁 Всего чатов: {len(links)}")
+        print(f"{'='*50}")
+        
+        # Задержка перед следующим циклом
+        print(f"\n🔄 Начинаю новый цикл через 10 секунд...")
+        await asyncio.sleep(10)
 
 async def main():
-    client = create_client_with_proxy()
-    await client.start()
-    print("✅ Клиент запущен, цикл каждые 15 минут. Нажмите Ctrl+C для остановки.")
-
-    cycle = 0
+    """Главная функция"""
     try:
-        while True:
-            cycle += 1
-            print(f"\n{'='*50}")
-            print(f"🔄 ЦИКЛ #{cycle} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"{'='*50}")
-            await process_links(client)
-            print(f"\n✅ Цикл #{cycle} завершён. Ожидание 15 минут...")
-            await asyncio.sleep(900)
+        await main_cycle()
     except KeyboardInterrupt:
-        print("\n🛑 Остановка пользователем")
+        print("\n⚠️ Работа прервана пользователем")
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e}")
+        print(f"❌ Критическая ошибка: {e}")
     finally:
         await client.disconnect()
-        print("👋 Отключено")
 
 if __name__ == "__main__":
+    print("""
+╔══════════════════════════════════════════╗
+║          ТЕЛЕГРАМ БОТ ДЛЯ РАССЫЛКИ       ║
+║      И АРХИВАЦИИ ЧАТОВ                   ║
+╚══════════════════════════════════════════╝
+    
+Функции:
+1. Рассылает сообщение из template.txt по чатам из users.txt
+2. Отправляет информацию о вступивших чатах в архив
+3. Работает в зацикленном режиме
+    
+Требуемые файлы:
+- template.txt - текст для рассылки
+- users.txt - список ссылок на чаты
+    
+Для остановки нажмите Ctrl+C
+    """)
+    
     asyncio.run(main())
